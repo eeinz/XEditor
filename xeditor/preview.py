@@ -23,6 +23,7 @@ class MarkdownPreview(QTextBrowser):
         self._base_dir: str | None = None
         self._zoom_steps = 0
         self._toc: list[TocEntry] = []
+        self._anchor_blocks: dict[str, int] = {}
 
         self.setOpenLinks(False)
         self.setOpenExternalLinks(False)
@@ -65,9 +66,27 @@ class MarkdownPreview(QTextBrowser):
         )
         self._toc = result.toc
         self.setHtml(result.html)
+        self._index_anchors()
         self._apply_zoom()
         self._restore_ratio_soon(ratio)
         return result.toc
+
+    def _index_anchors(self) -> None:
+        """Map HTML anchor names to QTextDocument block numbers once per render."""
+        anchors: dict[str, int] = {}
+        block = self.document().begin()
+        while block.isValid():
+            iterator = block.begin()
+            while not iterator.atEnd():
+                fragment = iterator.fragment()
+                fmt = fragment.charFormat()
+                if fmt.isAnchor():
+                    for name in fmt.anchorNames():
+                        if name and name not in anchors:
+                            anchors[str(name)] = block.blockNumber()
+                iterator += 1
+            block = block.next()
+        self._anchor_blocks = anchors
 
     def scroll_ratio(self) -> float:
         bar = self.verticalScrollBar()
@@ -90,9 +109,28 @@ class MarkdownPreview(QTextBrowser):
         QTimer.singleShot(0, lambda: self.set_scroll_ratio(ratio))
 
     def scroll_to_anchor(self, anchor: str) -> bool:
+        """Scroll to an anchor without relying on QTextBrowser's navigation.
+
+        QTextBrowser.scrollToAnchor can block on some documents; using the
+        already-laid-out block geometry is deterministic and cheap.
+        """
         if not anchor:
             return False
-        return self.scrollToAnchor(anchor)
+        block_number = self._anchor_blocks.get(anchor)
+        if block_number is None:
+            return False
+        block = self.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return False
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return True
+        rect = self.document().documentLayout().blockBoundingRect(block)
+        document_height = max(1.0, self.document().size().height())
+        ratio = (rect.top() - 10.0) / document_height
+        ratio = max(0.0, min(1.0, ratio))
+        bar.setValue(round(bar.maximum() * ratio))
+        return True
 
     # -- zoom --------------------------------------------------------------
     def _apply_zoom(self) -> None:
@@ -173,7 +211,7 @@ class MarkdownPreview(QTextBrowser):
             return
         if not url.scheme() and not url.path():
             if url.fragment():
-                self.scrollToAnchor(url.fragment())
+                self.scroll_to_anchor(url.fragment())
             return
         if not url.scheme():
             base = Path(self._base_dir) if self._base_dir else Path.cwd()

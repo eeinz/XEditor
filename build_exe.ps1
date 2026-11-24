@@ -19,6 +19,7 @@ python -m PyInstaller `
     --icon "assets\xeditor.ico" `
     --version-file "packaging\version_info.txt" `
     --collect-submodules markdown `
+    --collect-submodules xeditor `
     main.py
 
 if ($LASTEXITCODE -ne 0) {

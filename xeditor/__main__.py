@@ -1,7 +1,7 @@
 """Allow ``python -m xeditor`` to launch the application."""
 
-from .app import run
+from .launch import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(main())

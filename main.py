@@ -4,8 +4,8 @@ Run with:
     python main.py [path/to/file.md]
 """
 
-from xeditor.app import run
+from xeditor.launch import main
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(main())

@@ -10,6 +10,7 @@ open windows or require a display server.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -21,10 +22,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QFont, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QFileDialog, QFontDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QFontDialog
 
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="xeditor-test-"))
 QSettings.setDefaultFormat(QSettings.Format.IniFormat)
@@ -34,6 +35,7 @@ QSettings("XEditor", "XEditor").clear()
 from xeditor.app import create_app
 from xeditor.main_window import MainWindow
 from xeditor.renderer import render_document
+from xeditor.single_instance import _ACTIVATION_FILE
 from xeditor.themes import LIGHT
 
 app = create_app([])
@@ -387,6 +389,52 @@ def run():
         wait(100)
         check(window.editor.textCursor().blockNumber() > 0, "outline jump moves editor cursor")
 
+        # -- outline rebuild must not interleave with a mouse press ---------
+        tree.expandAll()
+        root_item = tree.topLevelItem(0)
+        tree.scrollToItem(root_item)
+        root_rect = tree.visualItemRect(root_item)
+        check(not root_rect.isEmpty(), "outline item has clickable geometry")
+        QTest.mousePress(
+            tree.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            root_rect.center(),
+        )
+        wait(30)
+        window.outline_panel.set_content("# 新标题 A\n\n# 新标题 B\n", [])
+        check(tree.topLevelItemCount() == 1, "outline rebuild deferred while mouse is pressed")
+        QTest.mouseRelease(
+            tree.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            root_rect.center(),
+        )
+        wait(250)
+        check(tree.topLevelItemCount() == 2, "deferred outline rebuild applied after release")
+
+        # -- wheel scrolling must also defer outline rebuilds ---------------
+        window.outline_panel.set_content("# A\n\n# B\n", [])
+        wait(200)
+        check(tree.topLevelItemCount() == 2, "outline prepared for wheel test")
+        wheel = QWheelEvent(
+            QPointF(20, 20),
+            QPointF(20, 20),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        QApplication.sendEvent(tree.viewport(), wheel)
+        wait(30)
+        check(window.outline_panel.is_wheel_scrolling(), "outline wheel activity detected")
+        window.outline_panel.set_content("# C\n\n# D\n\n# E\n", [])
+        check(tree.topLevelItemCount() == 2, "outline rebuild deferred during wheel")
+        wait(550)
+        check(tree.topLevelItemCount() == 3, "outline rebuild applied after wheel stops")
+
         # -- scroll sync ------------------------------------------------
         window.sync_action.setChecked(True)
         bar = window.editor.verticalScrollBar()
@@ -403,6 +451,19 @@ def run():
         wait(120)
         check(abs(window.preview.scroll_ratio() - frozen) < 0.02, "sync off keeps preview position")
         window.sync_action.setChecked(True)
+
+        # -- activation request (second instance hand-off) ----------------
+        window.editor.document().setModified(False)
+        activation_path = work / "activation-target.md"
+        activation_path.write_text("# Activation\n\nSecond instance hand-off.\n", encoding="utf-8")
+        _ACTIVATION_FILE.unlink(missing_ok=True)
+        _ACTIVATION_FILE.write_text(
+            json.dumps({"files": [str(activation_path)]}), encoding="utf-8"
+        )
+        wait(900)
+        check(window._current_path == activation_path, "activation request opens forwarded file")
+        check(not _ACTIVATION_FILE.exists(), "activation request consumed")
+        check("activation-target.md" in window.windowTitle(), "forwarded file updates title")
 
         # -- close ---------------------------------------------------------
         window.editor.document().setModified(False)

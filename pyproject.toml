@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xeditor-markdown"
-version = "1.0.0"
+version = "1.0.4"
 description = "A lightweight Markdown reader and editor built with Python and PySide6"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-xeditor = "xeditor.app:run"
+xeditor = "xeditor.launch:main"
 
 [tool.setuptools.packages.find]
 include = ["xeditor*"]

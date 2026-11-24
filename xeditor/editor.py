@@ -205,7 +205,7 @@ class MarkdownEditor(QPlainTextEdit):
         self._update_extra_selections()
 
     # -- navigation --------------------------------------------------------
-    def goto_line(self, line_number: int, select: bool = False) -> None:
+    def goto_line(self, line_number: int, select: bool = False, focus: bool = True) -> None:
         block = self.document().findBlockByNumber(max(0, line_number - 1))
         if not block.isValid():
             return
@@ -214,7 +214,8 @@ class MarkdownEditor(QPlainTextEdit):
             cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
         self.setTextCursor(cursor)
         self.centerCursor()
-        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        if focus:
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
 
     # -- keyboard behaviour ------------------------------------------------
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802

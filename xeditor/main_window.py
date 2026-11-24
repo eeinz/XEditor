@@ -56,6 +56,11 @@ from .outline import OutlinePanel
 from .preview import MarkdownPreview
 from .renderer import render_document
 from .settings import Settings
+from .single_instance import (
+    bring_window_to_front,
+    consume_activation_request,
+    has_pending_activation,
+)
 from .themes import THEMES, Theme, apply_theme, resolve_theme
 from .welcome import WELCOME_MD
 
@@ -77,6 +82,8 @@ class MainWindow(QMainWindow):
         self._reading_mode = False
         self._reading_restore: dict[str, bool] = {}
         self._syncing = False
+        self._outline_jumping = False
+        self._pending_outline: tuple[int, str] | None = None
         self._closing = False
         self._dock_width_applied = False
         self._cheat_sheet: MarkdownCheatSheet | None = None
@@ -537,6 +544,18 @@ class MainWindow(QMainWindow):
         self._autosave_timer.timeout.connect(self._autosave)
         self.autosave_action.toggled.connect(self._on_autosave_toggled)
 
+        # Coalesce and defer outline jumps until the click event has finished.
+        self._outline_jump_timer = QTimer(self)
+        self._outline_jump_timer.setSingleShot(True)
+        self._outline_jump_timer.setInterval(0)
+        self._outline_jump_timer.timeout.connect(self._perform_outline_jump)
+
+        # A duplicate launch writes an activation request; poll it cheaply.
+        self._activation_timer = QTimer(self)
+        self._activation_timer.setInterval(500)
+        self._activation_timer.timeout.connect(self._check_activation_request)
+        self._activation_timer.start()
+
         hints = QGuiApplication.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(self._on_system_scheme_changed)
@@ -865,6 +884,9 @@ class MainWindow(QMainWindow):
             or not self.editor.document().isModified()
         ):
             return
+        if self.outline_panel.is_wheel_scrolling():
+            self._autosave_timer.start()
+            return
         self._write_to(self._current_path, quiet=True)
 
     # ==================================================================
@@ -997,7 +1019,12 @@ class MainWindow(QMainWindow):
 
     def _on_cursor_changed(self) -> None:
         self._update_position()
-        self.outline_panel.set_current_line(self.editor.textCursor().blockNumber())
+        # Do not let an outline-originated jump immediately change or scroll
+        # the very tree item that the user just clicked.
+        if not self._outline_jumping:
+            self.outline_panel.set_current_line(
+                self.editor.textCursor().blockNumber()
+            )
 
     def _on_modified_changed(self, _modified: bool) -> None:
         self._update_title()
@@ -1056,6 +1083,15 @@ class MainWindow(QMainWindow):
         return cjk + latin
 
     def _refresh_preview(self) -> None:
+        # Avoid expensive rich-text re-layout while the user is interacting
+        # with the outline (mouse press or wheel) or dragging/selecting
+        # anywhere. The single-shot timer retries after interaction stops.
+        if (
+            QApplication.mouseButtons() != Qt.MouseButton.NoButton
+            or self.outline_panel.is_wheel_scrolling()
+        ):
+            self._preview_timer.start()
+            return
         self._preview_timer.stop()
         text = self.editor.toPlainText()
         base_dir = self._base_dir() or str(Path.cwd())
@@ -1068,7 +1104,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda l=first_line, t=total: self.preview.scroll_to_line_ratio(l, t))
 
     def _on_editor_scrolled(self, _value: int) -> None:
-        if self._syncing or not self.sync_action.isChecked() or not self.preview.isVisible():
+        if (
+            self._syncing
+            or self._outline_jumping
+            or not self.sync_action.isChecked()
+            or not self.preview.isVisible()
+        ):
             return
         bar = self.editor.verticalScrollBar()
         if bar.maximum() <= 0:
@@ -1080,16 +1121,31 @@ class MainWindow(QMainWindow):
             self._syncing = False
 
     def _on_heading_activated(self, line: int, anchor: str) -> None:
-        if not self._reading_mode:
-            self.editor.goto_line(line + 1)
-        if self.preview.isVisible():
-            if anchor:
-                self.preview.scroll_to_anchor(anchor)
-            else:
-                total = max(1, self.editor.blockCount())
-                self.preview.scroll_to_line_ratio(line, total)
-        if not self._reading_mode:
-            self.editor.setFocus()
+        """Queue an outline jump and coalesce rapid clicks."""
+        self._pending_outline = (line, anchor)
+        self._outline_jump_timer.start(0)
+
+    def _perform_outline_jump(self) -> None:
+        if self._outline_jumping or self._pending_outline is None:
+            return
+        line, anchor = self._pending_outline
+        self._pending_outline = None
+        self._outline_jumping = True
+        try:
+            if not self._reading_mode:
+                # Keep keyboard focus on the outline while the user browses
+                # headings. Repeatedly switching focus to the editor (and thus
+                # activating/deactivating the IME) can cause UI stalls.
+                self.editor.goto_line(line + 1, focus=False)
+            if self.preview.isVisible():
+                scrolled = False
+                if anchor:
+                    scrolled = self.preview.scroll_to_anchor(anchor)
+                if not scrolled:
+                    total = max(1, self.editor.blockCount())
+                    self.preview.scroll_to_line_ratio(line, total)
+        finally:
+            self._outline_jumping = False
 
     def _on_preview_file_link(self, path: str, fragment: str) -> None:
         self._open_path(path, fragment)
@@ -1211,6 +1267,51 @@ class MainWindow(QMainWindow):
         if self._reading_mode:
             self.reading_action.setChecked(False)
         self.find_bar.open_replace()
+
+    def _check_activation_request(self) -> None:
+        if not has_pending_activation():
+            return
+        # Do not open files or steal focus while one of our own dialogs is open.
+        if QApplication.activeModalWidget() is not None:
+            return
+        request = consume_activation_request()
+        if request is None:
+            return
+        self._activate_window()
+        files = request.get("files") or []
+        if not isinstance(files, list):
+            return
+        for raw in files:
+            if not isinstance(raw, str):
+                continue
+            try:
+                path = Path(raw)
+                if not path.is_file():
+                    continue
+                if (
+                    self._current_path is not None
+                    and path.resolve() == self._current_path.resolve()
+                ):
+                    continue
+            except OSError:
+                continue
+            self._open_path(str(path))
+            break
+
+    def _activate_window(self) -> None:
+        if self.isMinimized():
+            self.setWindowState(
+                self.windowState() & ~Qt.WindowState.WindowMinimized
+            )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        try:
+            bring_window_to_front(int(self.winId()))
+        except Exception:
+            pass
+        QApplication.alert(self, 0)
+        self.statusBar().showMessage("XEditor 已在运行", 1800)
 
     # ==================================================================
     # Recent files
